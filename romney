@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+from dat import DAT, RomFileGroup, RomFile
+import click
+import glob, os
+import hashlib, zlib, zipfile
+import hashmanager
+import binascii
+import sqlite3
+import colorama
+import time, math, errno
+import torrentarchive
+from pathlib import Path
+colorama.init(autoreset=True)
+
+
+
+def _log(color, prefix, *args):
+  print(color + prefix + " " + " ".join(map(str, args)))
+
+def log(*args):
+  _log(colorama.Fore.WHITE, "[MAIN]", *args)
+
+def warn(*args):
+  _log(colorama.Fore.RED, "[MAIN] WARNING:", *args)
+
+def hlog(text, color=colorama.Fore.BLUE):
+  _log(color, "[MAIN] +================", text, "================+")
+
+
+def hash_dir(dir, db_path, force_hash = False):
+  rfg = RomFileGroup()
+  
+  files = list(glob.iglob(dir + '/**/*', recursive=True))
+
+  # Strip directories
+  files = [f for f in files if not os.path.isdir(f)]
+
+  # Hash any files that aren't zips
+  hash_files = [f for f in files if not f.endswith('.zip')]
+  print(hash_files)
+
+  hm = hashmanager.HashManager(db_path=db_path)
+  sums = hm.multiget_sums(hash_files)
+  print(sums)
+ 
+  for path in files:
+    if path.endswith('.zip'):
+      # Recurse into zip files
+      log("Opening zipfile:", path)
+      try:
+        z = zipfile.ZipFile(path)
+      except zipfile.BadZipfile:
+        warn("Corrupt zip file at", path)
+        continue
+      for f in z.infolist():
+        log("Zip member:", f.filename)
+        log("Size:", f.file_size)
+        crc = "%08x" % f.CRC
+        log("CRC:", crc)
+        rfg.addFile(RomFile(f.filename, size=f.file_size, crc32=crc, in_archive=path))
+    else:
+      rfg.addFile(RomFile(path, size=os.path.getsize(path), sha1=sums[path]['sha1'], crc32=sums[path]['crc32']))
+  
+  return rfg
+
+def _link(src, dst, use_symlinks=False):
+  if os.path.exists(dst):
+    warn("Link destination already existed:", dst)
+    return False
+
+  dirname = os.path.dirname(dst)
+  if not os.path.exists(dirname):
+    log("Path didn't exist; creating directory", dirname)
+    os.makedirs(dirname)
+
+  if not use_symlinks:
+    try:
+      log("Hard linking %s -> %s" % (src, dst))
+      os.link(src, dst)
+    except OSError as e:
+      if e.errno == errno.EXDEV:
+        # Attempting to do a cross-device link
+        warn("Tried to use hard linking across devices. Using symlinks instead.")
+        use_symlinks = True
+      else:
+        raise
+
+  if use_symlinks:
+    print("Symlinking %s -> %s" % (src, dst))
+    os.symlink(src, dst)
+    return
+ 
+def sort_dir(sortdir, outdir, dat, db_path, dry_run = False, force_hash = False, use_symlinks = False):
+  log("Sorting directory", sortdir, "=>", outdir)
+  if dry_run:
+    log("------ DRY RUN ONLY ------")
+
+  if not dry_run:
+    if not os.path.exists(outdir):
+      os.mkdir(outdir)
+
+  rfg = hash_dir(sortdir, db_path, force_hash=force_hash)
+  known_files = []
+  unknown_files = []
+
+  migrated_files = []
+  complete_games = []
+  file_renames = []
+  zip_renames = []
+
+  for g in dat.games:
+    hlog("Checking game: %s " % g.name)
+
+    # Find instances of game file 0 on disk or in archives
+    f = g.files[0]
+
+    log("Scanning for first game file:", f.path, f.crc32, f.size)
+    results = rfg.findByCRCAndSize(f.crc32, f.size)
+    if not results:
+      log("Game file not found!")
+      continue
+    
+    # Files are sometimes shared between different games. In a scenario
+    # where the game files are on disk, the specific source file used to
+    # hard link to the output directory doesn't matter.
+    # 
+    # But in a scenario where game files are in zip archives, an archive
+    # must be found with an exact match of the exact set of files in a 
+    # game. Searching for archives that contain file[0] works, but it 
+    # must be further pared down later.
+    #
+    # In mixed environments (archives + folders of files) this is a bit
+    # trickier; we must consider the scenario that a game could be 
+    # complete in either potential state.
+    #
+    total_files = len(g.files)
+
+    # Consider the following possibilities for each found instance:
+    #
+    # In archive: determine if this archive is an exact match
+    # On disk: attempt to find siblings on disk to complete the game
+    #
+
+
+    for s in results:
+      if s.in_archive:
+        log("Found in archive", s.in_archive)
+        log("Checking archive contents for complete game (%d files)..." % total_files)
+        # Check that archive contains all of this game's files (and no others)
+        archive_files = rfg.getArchiveFiles(s.in_archive)
+        if len(archive_files) > total_files:
+          log("Too big: archive candidate had too many files to match this game (%s)")
+          continue
+        
+        found = []
+        missing = []
+
+        zip_rename_map = []
+        for f in g.files:
+          matches = archive_files.findByCRCAndSize(f.crc32, f.size)
+          if matches:
+            if len(matches) > 1:
+              warn("Multiple instances of same CRC found inside archive (possible?)")
+            
+            if matches[0].path != f.path:
+              warn("Zip entry path does not match game file path; queueing zip rename.")
+              log("(Zip)", matches[0].path, "(Game)", f.path)
+              zip_rename_map.append((matches[0].path, f.path))
+
+            found.append(f)
+            log("Found in archive (%d/%d):" % (len(found), total_files), f.path, f.crc32)
+            
+          else:
+            missing.append(f)
+            log("Missing from archive:", f.path, f.crc32)
+
+        if missing:
+          log("Archive candidate was missing %d file(s)" % len(missing))
+          continue
+        else:
+          log("Archive candidate matched complete game (%d/%d)" % (len(found), total_files))
+
+        # Game is complete. Before linking file, consider if the files inside need renaming.
+        # TODO#1 If map has items for renaming, do so now
+        # TODO#2 Warn user that when zip files are being sorted, they will be moved, not hard linked
+        #        since their contents may change due to renames. Maybe force them to choose mv/cp zips?
+        #
+        complete_games.append(g.name)
+        out_path = Path(outdir) / (g.name+'.zip')
+
+        if zip_rename_map:
+          zip_renames.append((s.in_archive, out_path, zip_rename_map))
+
+        else:
+          # Zip archive is pristine, so just link/copy/mv
+          file_renames.append([s.in_archive, out_path])
+
+      else:
+        log("Found on disk at", s.path)
+        # Check for all other files on disk (anywhere)
+        log("Checking disk for complete game (%d files)..." % total_files)
+        found = []
+        missing = []
+        for f in g.files:
+          ret = rfg.findByCRCAndSize(f.crc32, f.size, exclude_archives = True)
+          if ret:
+            found.append(ret[0])
+            log("Found on disk (%d/%d): %s" % (len(found), total_files, ret[0].path))
+          else:
+            missing.append(f)
+            log("Missing on disk:", f.path, f.crc32)
+        if missing:
+          log("Game was missing %d file(s) on disk" % len(missing))
+          continue
+        else:
+          log("Game was complete on disk (%d/%d)" % (len(found), total_files))
+          complete_games.append(g.name)
+          out_path = Path(outdir) / g.name
+          #if not os.path.exists(out_path):
+          #  os.mkdir(out_path)
+          for f in found:
+            target_path = out_path / g.files.findByCRCAndSize(f.crc32, f.size)[0].path
+            file_renames.append([f.path, target_path])
+          break
+
+  hlog("Performing queued zip renames") 
+  for src_archive, target_archive, rename_map in zip_renames:
+    # Perform renames, leaving source zip in place and writing into new location
+    a = torrentarchive.get(src_archive)
+    if not a.rename_files(rename_map, new_archive_filename=target_archive):
+      warn("Renaming zip members failed; skipping this zip")
+    else:
+      rfg.deleteByPath(src_archive)
+
+  hlog("Migrating queued files")
+  for source_fn, target_fn in file_renames:
+    log("Linking %s -> %s" % (source_fn, target_fn))
+    if not dry_run:
+      _link(source_fn, target_fn, use_symlinks)
+    rfg.deleteByPath(source_fn)
+
+  if rfg:
+    hlog("Unmigrated files:")
+    for f in rfg:
+      log(f.path, f.in_archive, f.crc32)
+  """
+  hlog("Missing games:")
+  for g in dat.games:
+    if not g.name in complete_games:
+      log(g.name)
+  """
+
+def dat_scan(romdir, dat, db_path, force_hash = False):
+  
+  # Files that exist in at least one game, hash verified
+  known_files = []
+ 
+  # Files that are in a game folder but fail checksum
+  damaged_files = {}
+
+  # Files that are in a game folder and pass checksum but need renaming
+  misnamed_files = []
+
+  # Files missing from a game whose folder exists on disk
+  # Key = game name -> list of files
+  missing_files = {}
+
+  # Games that have no folder on disk at all, or empty
+  missing_games = []
+
+  # Games that are complete on disk and all hashes verified
+  complete_games = []
+
+  damaged_games = []
+
+  # All files on disk
+  disk_files = hash_dir(romdir, db_path, force_hash=force_hash)
+
+  # Files that never got identified
+  unknown_files = []
+  
+
+  # Files that are unknown / in an unknown folder, but whose checksum matches a valid (and missing) game
+  rename_files = []
+
+  # Same as above, but the game already exists on disk
+  delete_files = []
+
+
+
+  # Games should exist in two possible ways.
+  #
+  # In a TorrentZip archive:
+  #   rootdir/GAMENAME.zip (with files within)
+  # 
+  # Or directly on disk:
+  #   rootdir/GAMENAME/
+  #    -> gamefile1.ext
+  #    -> gamefile2.ext
+  #
+  # So, any file found that matches a game file should
+  # have a parent directory or archive that is named
+  # the same as the game, and it should have all the other
+  # sibling files present as required by the DAT to be
+  # considered complete.
+  # 
+  # If a file exists but isn't in the proper parent folder,
+  # it could be in a few potential states:
+  # 
+  #   1. The same file is used in more than one game
+  #   2. The file is in a folder/archive with a name that 
+  #      didn't match a game title
+  # [...]
+
+
+  # First search all games in the DAT file
+  for g in dat.games:
+    game_is_damaged = False
+
+
+    # If the folder does not exist as all, game is missing
+    #if not os.path.exists(Path(romdir) / g.name):
+    #  missing_games.append(g)
+    #  continue
+
+    # Check for each rom file for this game
+    for f in g.files:
+      disk_f = disk_files.findByFilename(f.path)
+
+      if not disk_f:
+        missing_files.setdefault(g.name, []).append(f)
+        game_is_damaged = True
+        continue
+      
+      if not f.sha1 == disk_f.sha1:
+        print("SHA1 mismatch: datfile %s disk %s" % (f.sha1, disk_f.sha1))
+        damaged_files.setdefault(g.name, []).append(f)
+        game_is_damaged = True
+        continue
+
+    if game_is_damaged:
+      damaged_games.append(g)
+    else:
+      complete_games.append(g)
+
+  # Reverse scanning: scan the files on disk and highlight files that are unknown
+  for f in disk_files:
+    if os.path.isdir(f.path):
+      game_dir = dat.findGameByName(os.path.basename(f.path))
+      if not game_dir:
+        unknown_files.append(f)
+      continue
+
+    if f.in_archive:
+      parent_base = f.in_archive.split('/')[-1].split('.')[:-1]
+    else:
+      parent_base = f.path.split('/')[-2]
+    games = dat.findGamesBySHA(f.sha1)
+    if games:
+      game_matched = False
+      # Make sure this file has the right filename in the folder it's in, not that it just exists in the DAT file
+      for g in games:
+        if parent_base == g.name:
+          known_files.append(f)
+          game_matched = True
+          break
+    if not game_matched:
+      log("SCAN: Unknown file at %s, but hash belongs to one or more known games:" % f.path)
+      for g in games:
+        if g in complete_games:
+          log("Already have: %s" % g.name)
+          delete_files.append(f)
+        elif g in missing_games:
+          log("Missing game: %s" % g.name)
+          rename_files.append(f)
+        elif g in damaged_games:
+          log("Damaged game: %s" % g.name)
+          rename_files.append(f)
+        else:
+          log("Something else? %s --> %s" % (f.path, g.name))
+      rename_files.append(f)
+      unknown_files.append(f)
+  
+  log("Report:")
+  log("Have: %d/%d known games" % (len(complete_games), len(dat.games)))
+  for cg in complete_games:
+    log("HAVE: %s" % cg.name)
+  for mg in missing_games:
+    log("MISSING: %s" % mg.name)
+  for dg in damaged_games:
+    log("DAMAGED: %s" % dg.name)
+
+  if unknown_files:
+    log("*** Unknown files:")
+  for uf in unknown_files:
+    log(uf.path)
+  
+
+  # TODO: Recommendations / cleanup of files to be deleted or renamed to match DAT
+
+
+@click.group()
+@click.option('--db', type=click.Path(writable=True), help="path to database file (default: %s)" % str(Path.home()/'.romney.db'))
+@click.option('--force-hash', is_flag=True, help="force re-hashing of any files scanned")
+@click.option('--dry-run', is_flag=True, help="do not actually create or change anything")
+@click.pass_obj
+def cli(cfg, db, force_hash, dry_run):
+  if not db:
+    db = str(Path.home()/'.romney.db')
+    print("Using default database location: %s" % db)
+  cfg['db'] = db
+  cfg['force_hash'] = force_hash
+  cfg['dry_run'] = dry_run
+
+@cli.command()
+@click.argument('datfile', type=click.Path(exists=True, readable=True))
+@click.argument('sortdir', type=click.Path(exists=True, readable=True))
+@click.argument('outdir', type=click.Path(writable=True))
+@click.pass_obj
+def sort(cfg, datfile, sortdir, outdir):
+  """
+  Sorts files in SORTDIR using DATFILE, symlinking them into OUTDIR.
+  """
+  if not os.path.exists(outdir):
+    print("Creating output dir: ", outdir)
+    os.mkdir(outdir)
+
+  sort_dir(sortdir, outdir, DAT(datfile), db_path=cfg['db'], dry_run = cfg['dry_run'], force_hash = cfg['force_hash'])
+
+@cli.command()
+@click.option('--repair', is_flag=True)
+@click.argument('datfile', type=click.Path(exists=True, readable=True))
+@click.argument('romdir', type=click.Path(exists=True, writable=True))
+@click.pass_obj
+def scan(cfg, repair, datfile, romdir):
+  """
+  Scans files on disk using DATFILE as a template.
+
+  Reports have/missing/broken games and provides repair facilities.
+  """
+  dat_scan(romdir, DAT(datfile), db_path=cfg['db'], force_hash = cfg['force_hash'])
+
+
+if __name__ == '__main__':
+  cli(obj={})

@@ -1,0 +1,168 @@
+is command:
+  a    b      d      e       l     t     u    x
+  add  ?      delete extract list  test  ?    extract
+  
+is allowed:
+  e, l, t, x
+  -bd, -ao, -o, -slt, -y, -ssc, -ssc, -scsutf-8, -scswin, -scsdos
+  
+if is_allowed (everything but a), op mode = 777
+if a command, op mode = 2
+
+
+cmpro/nonsolid mode allows d and sets op mode to 3
+
+
+op mode = 0    unknown command used
+op mode = 1    convert a 7z/zip/rar to t7z mode (seems probably broken)
+op mode = 2    looks like archive creation (a command only)
+op mode = 3    cmpro mode, enables d
+op mode = 777  all non-a allowed commands, adds -ba and -r
+
+archive creation mode:
+
+sd: solid mode (-ms=XXXf4g)
+pd: -m0=LZMA:a1:d<dictionarysize>m:mf=BT4:fb128:mc80:lc4:lp0:pb2
+archive: output.7z
+
+# r - recursive
+# t7z - type=7z, use a 7z archive
+# mx=9 - compression level 9 (highest)
+# mf=on - unknown
+# mhc=on
+# mhe=off 
+# mmt=2 - number of CPU threads = 2
+# mtc=off
+# mta=off
+# mtm=off
+# ba - unknown
+#
+#
+# m0=LZMA
+# # https://stackoverflow.com/questions/3057171/lzma-compression-settings-details
+# # -m0=LZMA:a1:d<dictionarysize>m:mf=BT4:fb128:mc80:lc4:lp0:pb2
+# a1: algo (0=fast, 1=normal; default 1)
+# d{x}m dictionary size in megs (variable)
+# mf=BT4:fb128:mc80:lc4:lp0:pb2
+#   BT4: sets btMode (BT4/binTree is default)
+#   fb128: number of fast bytes (128 is default)
+#   mc80: number of cycles/passes for match finder (default is 32)
+#   lc4: number of high bits of previous byte to use as context (default 3)
+#   lp0: number of low bits of dict position to include in literal_pos_state (default 0)
+#   pb2: number of low bits of dict position to include in pos_state (default 2)
+#
+
+
+7za a -r -t7z -mx=9 <sd> -mf=on -mhc=on -mhe=off -mmt=2 -mtc=off -mta=off -mtm=off <pd> -ba -- <archive>
+
+solid mode is used based on GetDictionarySize (seems like it's used )
+
+after 7za is run, t7z signature is added
+
+struct finfo
+{
+    NWindows::NFile::NFind::CFileInfo fileInfo;
+    UInt32 fcount; // file count
+    UInt32 dcount; // directory count
+    UInt32 tcount; // total count (including files and directories)
+    UInt64 ttl_fs; // total filesize
+    UInt64 max_fs; // largest filesize
+    UInt64 min_fs; // smallest filesize
+    UInt64 avg_fs; // average filesize (ttl_fs/fcount)
+    bool debugprint; 
+    CSysStringVector*dirlist;
+    CSysStringVector*filelist;
+};
+
+# info on solid archive utility: http://www.peazip.org/what-is-solid-compression.html
+
+GetDictionarySize determines how big the dictionary should be for compression (in MB), as well as whether to create a solid archive (benefits situations with lots of small files). 
+
+d = 16 # start at 16MB
+dmaxfs = max_filesize - avg_filesize
+dminfs = avg_filesize - min_filesize
+# if the average filesize is weighted more by heavy files, don't use a solid archive
+# or if you just have 1 file don't enable a solid archive
+if fcount < 2 or dmaxfs > dminfs:
+  solid = false
+else:
+  solid = true
+# now calc proper dict size
+if not solid, dict is set to a fixed 16M
+otherwise, dict is set within 16M-80M range
+dict_size = total_filesize / 2M
+if max_filesize < 60M: 
+  # archive is small files, cap it at 64M
+  dict_size = min(dict_size, 64)
+# Keep dict in 16M-80M range
+d=min(max(16,d),80) (16M-80M range)
+
+## T7Z Signature
+# writes CRC32 of something at end of file
+# writes fixed T7Z signature
+const int crcsz=128;
+
+# CRC32(first 128 bytes, last 128 bytes, filesize, 0xffffffff, T7Z string)
+# Write crc32 at end of file
+# Write T7Z string at end of file 
+
+
+seek to beginning of file
+crcsz = 128
+read (crcsz) # leading crc
+if bytes_read < crcsz:
+  set remaining bytes in read crc to 0
+foffs = end - crcsz
+(seek to new foffs)
+read trailing crc into buf+crcsz (buf is now <first crc><last crc>)
+store file length in buf <first crc(s128)><last crc(s128)><last offset(u64)>
+store 0xffffffff in buf <first crc(s128)><last crc(s128)><last offset(u64)><0xffffffff>
+store fixed t7z sig at end of buf <first crc(s128)><last crc(s128)><last offset(u64)><0xffffffff><t7z sig>
+calculate crc32 of buf
+seek to end of file
+write crc32 (4 bytes)
+write fixed t7zsig (34 bytes)
+
+
+fixed t7zsig:
+  byte 16 is a bitmask
+  1 - unicode on (default)
+  2 - archive has only a single file
+  4 - filenames are not included
+
+"\xa9\x9f\xd1\x57\x08\xa9\xd7\xea\x29\x64\xb2\x36\x1b\x83\x52\x33\x00torrent7z_0.9beta"
+
+
+
+
+
+
+
+
+
+bool CInFile::Read(void *data, UInt32 size, UInt32 &processedSize)
+bool COutFile::Write(const void *data, UInt32 size, UInt32 &processedSize)
+bool CFileBase::SeekToEnd(UInt64 &newPosition)
+
+
+
+1. Make sure 7za is new enough to have rn feature
+2. Check file list in 7za and compare to new names; make sure collation is identical
+3. Verify input file is t7z and verify signature
+4. Run 7za rn as needed
+5. Strip t7z signature and recalculate/add signature
+
+7za rn archive.7z old/location/old.txt new/location/new.txt
+
+
+
+
+
+
+
+** Simplify torrentzip.py to use zipnote? 
+ 1. Run zipnote once to rename files
+ 2. Calculate CRC of central records (may need to dig in manually for this)
+ 3. Add new TORRENTZIPPED-XXXXXXXX
+ 
+ 
